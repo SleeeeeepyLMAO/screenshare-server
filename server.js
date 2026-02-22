@@ -1,124 +1,103 @@
 const WebSocket = require('ws');
 const http = require('http');
-const fs = require('fs');
-const path = require('path');
 
 const server = http.createServer((req, res) => {
-  let filePath = path.join(__dirname, 'web', req.url === '/' ? 'index.html' : req.url);
-  fs.readFile(filePath, (err, data) => {
-    if (err) { res.writeHead(404); res.end('Not found'); return; }
-    const mime = { '.html': 'text/html', '.js': 'application/javascript', '.css': 'text/css' };
-    res.writeHead(200, { 'Content-Type': mime[path.extname(filePath)] || 'text/plain' });
-    res.end(data);
-  });
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+
+  if (req.method === 'OPTIONS') {
+    res.writeHead(204);
+    res.end();
+    return;
+  }
+
+  // POST /frame/:code — phone sends a JPEG frame
+  if (req.method === 'POST' && req.url.startsWith('/frame/')) {
+    const code = req.url.split('/frame/')[1];
+    let chunks = [];
+    req.on('data', chunk => chunks.push(chunk));
+    req.on('end', () => {
+      const frameData = Buffer.concat(chunks);
+      if (!sessions[code]) sessions[code] = { viewers: [], lastFrame: null };
+      sessions[code].lastFrame = frameData; // store latest frame
+      // Forward to all connected viewers
+      sessions[code].viewers.forEach(ws => {
+        if (ws.readyState === WebSocket.OPEN) ws.send(frameData);
+      });
+      res.writeHead(200);
+      res.end('ok');
+    });
+    return;
+  }
+
+  // POST /session/:code/start
+  if (req.method === 'POST' && req.url.startsWith('/session/') && req.url.endsWith('/start')) {
+    const code = req.url.split('/session/')[1].split('/start')[0];
+    sessions[code] = { viewers: [], lastFrame: null };
+    console.log(`[+] Session started: ${code}`);
+    res.writeHead(200);
+    res.end('ok');
+    return;
+  }
+
+  // POST /session/:code/stop
+  if (req.method === 'POST' && req.url.startsWith('/session/') && req.url.endsWith('/stop')) {
+    const code = req.url.split('/session/')[1].split('/stop')[0];
+    if (sessions[code]) {
+      sessions[code].viewers.forEach(ws => {
+        if (ws.readyState === WebSocket.OPEN)
+          ws.send(JSON.stringify({ type: 'disconnected' }));
+      });
+      delete sessions[code];
+    }
+    console.log(`[-] Session stopped: ${code}`);
+    res.writeHead(200);
+    res.end('ok');
+    return;
+  }
+
+  // GET /session/:code/check
+  if (req.method === 'GET' && req.url.startsWith('/session/') && req.url.endsWith('/check')) {
+    const code = req.url.split('/session/')[1].split('/check')[0];
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ active: !!sessions[code] }));
+    return;
+  }
+
+  res.writeHead(404);
+  res.end('Not found');
 });
 
 const wss = new WebSocket.Server({ server });
-
-// sessions[code] = { phone: ws, viewers: [ws] }
 const sessions = {};
 
-wss.on('connection', (ws) => {
-  let role = null;
-  let code = null;
+wss.on('connection', (ws, req) => {
+  if (!req.url.startsWith('/watch/')) { ws.close(); return; }
+  const code = req.url.split('/watch/')[1];
 
-  ws.on('message', (msg) => {
-    // Binary = JPEG frame from phone → forward to all viewers
-    if (Buffer.isBuffer(msg) && role === 'phone') {
-      if (sessions[code]) {
-        sessions[code].viewers.forEach(v => {
-          if (v.readyState === WebSocket.OPEN) v.send(msg);
-        });
-      }
-      return;
-    }
+  console.log(`[+] Viewer connected for code: ${code}`);
 
-    let data;
-    try { data = JSON.parse(msg); } catch { return; }
+  if (!sessions[code]) {
+    ws.send(JSON.stringify({ type: 'error', message: 'Invalid code' }));
+    ws.close();
+    return;
+  }
 
-    // ── Phone registration ──
-    if (data.type === 'register_phone') {
-      code = data.code;
-      role = 'phone';
-      sessions[code] = { phone: ws, viewers: [] };
-      ws.send(JSON.stringify({ type: 'registered', code }));
-      console.log(`[+] Phone registered: ${code}`);
-    }
+  sessions[code].viewers.push(ws);
 
-    // ── WebRTC: phone sends offer ──
-    else if (data.type === 'offer') {
-      if (sessions[code]) {
-        sessions[code].offer = data.sdp;
-        // forward to any already-waiting viewer
-        sessions[code].viewers.forEach(v => {
-          if (v.readyState === WebSocket.OPEN)
-            v.send(JSON.stringify({ type: 'offer', sdp: data.sdp }));
-        });
-      }
-    }
-
-    // ── WebRTC: viewer sends answer ──
-    else if (data.type === 'answer') {
-      if (sessions[code]?.phone?.readyState === WebSocket.OPEN)
-        sessions[code].phone.send(JSON.stringify({ type: 'answer', sdp: data.sdp }));
-    }
-
-    // ── ICE candidates (both directions) ──
-    else if (data.type === 'ice_candidate') {
-      if (role === 'phone') {
-        sessions[code]?.viewers.forEach(v => {
-          if (v.readyState === WebSocket.OPEN)
-            v.send(JSON.stringify({ type: 'ice_candidate', candidate: data.candidate }));
-        });
-      } else {
-        if (sessions[code]?.phone?.readyState === WebSocket.OPEN)
-          sessions[code].phone.send(JSON.stringify({ type: 'ice_candidate', candidate: data.candidate }));
-      }
-    }
-
-    // ── Viewer joins ──
-    else if (data.type === 'join_viewer') {
-      code = data.code;
-      role = 'viewer';
-      if (!sessions[code] || !sessions[code].phone) {
-        ws.send(JSON.stringify({ type: 'error', message: 'Invalid or inactive code' }));
-        return;
-      }
-      sessions[code].viewers.push(ws);
-      ws.send(JSON.stringify({ type: 'joined', code }));
-      // If phone already sent an offer, relay it now
-      if (sessions[code].offer) {
-        ws.send(JSON.stringify({ type: 'offer', sdp: sessions[code].offer }));
-      }
-      // Tell phone
-      if (sessions[code].phone.readyState === WebSocket.OPEN)
-        sessions[code].phone.send(JSON.stringify({ type: 'viewer_joined' }));
-      console.log(`[+] Viewer joined: ${code}`);
-    }
-
-    // ── Touch from viewer → phone ──
-    else if (data.type === 'touch') {
-      if (sessions[code]?.phone?.readyState === WebSocket.OPEN)
-        sessions[code].phone.send(JSON.stringify(data));
-    }
-  });
+  // Send the last frame immediately so viewer doesn't wait
+  if (sessions[code].lastFrame) {
+    ws.send(sessions[code].lastFrame);
+  }
 
   ws.on('close', () => {
-    if (!code || !sessions[code]) return;
-    if (role === 'phone') {
-      sessions[code].viewers.forEach(v => {
-        if (v.readyState === WebSocket.OPEN)
-          v.send(JSON.stringify({ type: 'disconnected' }));
-      });
-      delete sessions[code];
-      console.log(`[-] Phone disconnected: ${code}`);
-    } else if (role === 'viewer') {
+    if (sessions[code]) {
       sessions[code].viewers = sessions[code].viewers.filter(v => v !== ws);
-      if (sessions[code].phone?.readyState === WebSocket.OPEN)
-        sessions[code].phone.send(JSON.stringify({ type: 'viewer_left' }));
     }
+    console.log(`[-] Viewer disconnected for code: ${code}`);
   });
 });
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`ScreenShare server → http://localhost:${PORT}`));
+server.listen(PORT, () => console.log(`ScreenShare server running on port ${PORT}`));
